@@ -696,3 +696,28 @@ def test_write_replaces_destination_symlink_directory_and_rollback_restores_it(
         assert (skills / "lacuna-signer").is_symlink()
         assert (skills / "lacuna-signer").readlink() == clone
         assert not (skills / "lacuna-signer" / "SKILL.md").exists()
+
+
+def test_write_replaces_symlink_when_destination_prefix_is_used(tmp_path: Path) -> None:
+    """Mirror lacuna skill install: destination=.grok/skills under home base."""
+    home = tmp_path / "home"
+    skills = home / ".grok" / "skills"
+    clone = tmp_path / "repo-clone"
+    skills.mkdir(parents=True)
+    clone.mkdir()
+    (skills / "lacuna-signer").symlink_to(clone)
+
+    effect = ReconcileFileSetEffect()
+    with SafeFilesystem(home) as filesystem:
+        prepared = _prepare(
+            effect,
+            filesystem,
+            home,
+            [{"path": "lacuna-signer/SKILL.md", "content": "skill\n"}],
+            destination=".grok/skills",
+        )
+        writer = RecordingCheckpointWriter(filesystem)
+        effect.apply(prepared, writer)
+        assert (skills / "lacuna-signer").is_dir()
+        assert not (skills / "lacuna-signer").is_symlink()
+        assert (skills / "lacuna-signer" / "SKILL.md").read_text(encoding="utf-8") == "skill\n"

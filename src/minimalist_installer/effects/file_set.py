@@ -794,7 +794,12 @@ class ReconcileFileSetEffect:
         }
         probe = getattr(filesystem, "probe_entry", None)
         read_link = getattr(filesystem, "read_symlink", None)
+        # Walk shallowest-first. Once a parent is a symlink (to be replaced),
+        # deeper descendants are treated as absent without probing through it.
         for parent in all_desired_parents:
+            if any(_is_parent(replaced, parent) for replaced in replaced_symlink_targets):
+                absent_parents.add(parent)
+                continue
             if probe is None:
                 if not filesystem.directory_exists(parent):
                     absent_parents.add(parent)
