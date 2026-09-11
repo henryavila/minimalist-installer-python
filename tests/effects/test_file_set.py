@@ -84,6 +84,20 @@ class RecordingFilesystem:
         self.events.append(f"mkdir:{relative}")
         self._filesystem.ensure_directory(relative)
 
+    def probe_entry(self, relative: str):
+        return self._filesystem.probe_entry(relative)
+
+    def read_symlink(self, relative: str) -> str:
+        return self._filesystem.read_symlink(relative)
+
+    def replace_symlink_with_directory(self, relative: str) -> str | None:
+        self.events.append(f"replace-symlink:{relative}")
+        return self._filesystem.replace_symlink_with_directory(relative)
+
+    def symlink(self, relative: str, target: str) -> None:
+        self.events.append(f"symlink:{relative}")
+        self._filesystem.symlink(relative, target)
+
     def atomic_write_bytes(
         self, relative: str, data: bytes, *, mode: int = 0o600
     ) -> None:
@@ -641,3 +655,44 @@ def test_update_cleans_missing_orphan_parents_without_reclaiming_other_paths(
     assert preexisting.is_dir()
     assert list(preexisting.iterdir()) == []
     assert (tmp_path / "owned-desired/deep/file.txt").read_bytes() == b"desired-v2"
+
+
+def test_write_replaces_destination_symlink_directory_and_rollback_restores_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "home"
+    skills = root / ".grok" / "skills"
+    clone = tmp_path / "repo-clone"
+    skills.mkdir(parents=True)
+    clone.mkdir()
+    (skills / "lacuna-signer").symlink_to(clone)
+    (clone / "README.md").write_text("repo\n", encoding="utf-8")
+
+    effect = ReconcileFileSetEffect()
+    with SafeFilesystem(skills) as filesystem:
+        prepared = _prepare(
+            effect,
+            filesystem,
+            skills,
+            [{"path": "lacuna-signer/SKILL.md", "content": "skill body\n"}],
+        )
+        writer = RecordingCheckpointWriter(filesystem)
+        effect.apply(prepared, writer)
+
+        assert (skills / "lacuna-signer").is_dir()
+        assert not (skills / "lacuna-signer").is_symlink()
+        assert (skills / "lacuna-signer" / "SKILL.md").read_text(encoding="utf-8") == (
+            "skill body\n"
+        )
+        # Original clone untouched.
+        assert (clone / "README.md").read_text(encoding="utf-8") == "repo\n"
+
+        effect.revert(
+            _context(skills, filesystem, operation=Operation.INSTALL),
+            prepared.before_state,
+            writer,
+        )
+
+        assert (skills / "lacuna-signer").is_symlink()
+        assert (skills / "lacuna-signer").readlink() == clone
+        assert not (skills / "lacuna-signer" / "SKILL.md").exists()

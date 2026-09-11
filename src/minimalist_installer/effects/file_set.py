@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Protocol, cast
 
 from ..core.errors import (
+    UnsafePathError,
     GreenfieldConflictError,
     InvalidEffectError,
     ModifiedContentError,
@@ -26,6 +27,7 @@ from ..core.models import (
     PreparedEffect,
     _json_value,
 )
+from ..core.path_safety import PathEntryKind
 
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _STATE_VERSION = 1
@@ -44,6 +46,14 @@ class _EffectFilesystem(Protocol):
     def directory_exists(self, relative: str) -> bool: ...
 
     def ensure_directory(self, relative: str) -> None: ...
+
+    def probe_entry(self, relative: str) -> PathEntryKind | None: ...
+
+    def read_symlink(self, relative: str) -> str: ...
+
+    def replace_symlink_with_directory(self, relative: str) -> str | None: ...
+
+    def symlink(self, relative: str, target: str) -> None: ...
 
     def atomic_write_bytes(
         self, relative: str, data: bytes, *, mode: int = 0o600
@@ -209,6 +219,21 @@ def _read_optional(filesystem: _EffectFilesystem, path: str) -> bytes | None:
         return None
 
 
+def _read_optional_under_replaced_parents(
+    filesystem: _EffectFilesystem,
+    path: str,
+    symlink_parents: set[str],
+) -> bytes | None:
+    try:
+        return filesystem.read_bytes(path)
+    except FileNotFoundError:
+        return None
+    except UnsafePathError:
+        if any(_is_parent(parent, path) for parent in symlink_parents):
+            return None
+        raise
+
+
 def _joined_path(destination: str, path: str) -> str:
     return path if destination == "." else f"{destination}/{path}"
 
@@ -290,17 +315,40 @@ def _parse_desired(
     return tuple(sorted(parsed, key=lambda item: cast(str, item["path"]).encode()))
 
 
+def _parse_replaced_symlinks(value: object) -> tuple[dict[str, str], ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list | tuple):
+        raise TypeError("replaced_symlinks must be an array")
+    parsed: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for index, entry in enumerate(value):
+        if not isinstance(entry, Mapping):
+            raise TypeError(f"replaced_symlinks[{index}] must be an object")
+        _exact_keys(entry, frozenset({"path", "target"}), f"replaced_symlinks[{index}]")
+        rel = _normalize_relative(entry["path"], f"replaced_symlinks[{index}].path")
+        target = entry["target"]
+        if not isinstance(target, str) or not target:
+            raise ValueError(f"replaced_symlinks[{index}].target must be non-empty text")
+        if rel in seen:
+            raise ValueError(f'duplicate replaced symlink path: "{rel}"')
+        seen.add(rel)
+        parsed.append({"path": rel, "target": target})
+    return tuple(sorted(parsed, key=lambda item: item["path"].encode()))
+
+
 def _parse_state(
     value: JsonValue | None,
-) -> tuple[tuple[dict[str, str], ...], tuple[str, ...]]:
+) -> tuple[tuple[dict[str, str], ...], tuple[str, ...], tuple[dict[str, str], ...]]:
     if value is None:
-        return (), ()
+        return (), (), ()
     if not isinstance(value, Mapping):
         raise TypeError("previous file-set state must be an object")
     keys = frozenset(value)
     legacy_keys = frozenset({"version", "files"})
     current_keys = frozenset({"version", "files", "created_parents"})
-    if keys not in {legacy_keys, current_keys}:
+    with_symlinks = frozenset({"version", "files", "created_parents", "replaced_symlinks"})
+    if keys not in {legacy_keys, current_keys, with_symlinks}:
         raise ValueError(
             "previous state keys must describe files and created parents"
         )
@@ -334,7 +382,19 @@ def _parse_state(
     )
     if any(not any(_is_parent(parent, item["path"]) for item in ordered_files) for parent in parents):
         raise ValueError("previous created parent does not own a tracked file path")
-    return ordered_files, parents
+    replaced = (
+        _parse_replaced_symlinks(value.get("replaced_symlinks"))
+        if "replaced_symlinks" in value
+        else ()
+    )
+    if any(
+        not any(_is_parent(item["path"], tracked["path"]) or item["path"] == tracked["path"]
+                for tracked in ordered_files)
+        for item in replaced
+    ):
+        # replaced symlink must be a parent (or equal) of some tracked file
+        raise ValueError("replaced symlink path does not own a tracked file path")
+    return ordered_files, parents, replaced
 
 
 def _decision_payload(
@@ -454,11 +514,111 @@ def _parse_prepared(prepared: PreparedEffect) -> tuple[_EffectFilesystem, tuple[
     return filesystem, tuple(parsed)
 
 
+def _apply_symlink_replacements(
+    filesystem: _EffectFilesystem,
+    before_state: JsonValue,
+    checkpoint: CheckpointWriter,
+) -> None:
+    _files, _created, replaced = _parse_state(before_state)
+    # Replace shallowest first so parent directories exist for nested paths.
+    for index, entry in enumerate(replaced):
+        name = f"symlink-replace:{index:06d}"
+        existing = checkpoint.read(name)
+        path = entry["path"]
+        target = entry["target"]
+        if existing is not None:
+            if not isinstance(existing, Mapping):
+                raise InvalidEffectError("symlink-replace checkpoint must be an object")
+            if (
+                existing.get("path") != path
+                or existing.get("target") != target
+                or existing.get("phase") not in {"ready", "done"}
+            ):
+                raise InvalidEffectError("symlink-replace checkpoint is inconsistent")
+            if existing.get("phase") == "done":
+                continue
+        else:
+            checkpoint.write(
+                name,
+                {"phase": "ready", "path": path, "target": target},
+            )
+        replace = getattr(filesystem, "replace_symlink_with_directory", None)
+        if replace is None:
+            raise InvalidEffectError(
+                "filesystem cannot replace symlink parents during apply"
+            )
+        previous = replace(path)
+        if previous not in {None, target}:
+            raise InvalidEffectError(
+                f'symlink target changed under "{path}" before replacement'
+            )
+        checkpoint.write(
+            name,
+            {"phase": "done", "path": path, "target": target},
+        )
+
+
+def _restore_symlink_replacements(
+    filesystem: _EffectFilesystem,
+    before_state: JsonValue,
+    checkpoint: CheckpointWriter,
+) -> None:
+    _files, _created, replaced = _parse_state(before_state)
+    # Restore deepest first so we recreate children before parents if nested.
+    for index, entry in enumerate(reversed(replaced)):
+        original_index = len(replaced) - 1 - index
+        name = f"symlink-restore:{original_index:06d}"
+        path = entry["path"]
+        target = entry["target"]
+        existing = checkpoint.read(name)
+        if existing is not None:
+            if not isinstance(existing, Mapping):
+                raise InvalidEffectError("symlink-restore checkpoint must be an object")
+            if (
+                existing.get("path") != path
+                or existing.get("target") != target
+                or existing.get("phase") not in {"ready", "done"}
+            ):
+                raise InvalidEffectError("symlink-restore checkpoint is inconsistent")
+            if existing.get("phase") == "done":
+                continue
+        else:
+            checkpoint.write(
+                name,
+                {"phase": "ready", "path": path, "target": target},
+            )
+        probe = getattr(filesystem, "probe_entry", None)
+        make_symlink = getattr(filesystem, "symlink", None)
+        if probe is None or make_symlink is None:
+            raise InvalidEffectError(
+                "filesystem cannot restore symlink parents during rollback"
+            )
+        kind = probe(path)
+        if kind is PathEntryKind.DIRECTORY:
+            filesystem.rmdir_empty(path, missing_ok=False)
+        elif kind is PathEntryKind.SYMLINK:
+            # Already restored.
+            checkpoint.write(
+                name,
+                {"phase": "done", "path": path, "target": target, "outcome": "already"},
+            )
+            continue
+        elif kind is not None:
+            raise InvalidEffectError(
+                f'cannot restore symlink over non-directory leaf "{path}"'
+            )
+        make_symlink(path, target)
+        checkpoint.write(
+            name,
+            {"phase": "done", "path": path, "target": target, "outcome": "restored"},
+        )
+
+
 def _validate_tracking_state(
     before_state: JsonValue,
     decisions: Sequence[Mapping[str, JsonValue]],
 ) -> tuple[tuple[dict[str, str], ...], tuple[str, ...]]:
-    files, created_parents = _parse_state(before_state)
+    files, created_parents, _replaced = _parse_state(before_state)
     expected: list[dict[str, str]] = []
     expected_parents: list[str] = []
     for item in decisions:
@@ -610,7 +770,7 @@ class ReconcileFileSetEffect:
             raise TypeError("args.adopt_identical must be a boolean")
         filesystem = _filesystem(context.filesystem, "file-set prepare")
         desired = _parse_desired(args["desired"], destination)
-        previous_files, previous_created_parents = _parse_state(previous)
+        previous_files, previous_created_parents, previous_replaced = _parse_state(previous)
         desired_by_path = {cast(str, entry["path"]): entry for entry in desired}
         previous_by_path = {entry["path"]: entry for entry in previous_files}
         all_paths = sorted(
@@ -628,11 +788,32 @@ class ReconcileFileSetEffect:
                 for parent in parents
             )
         )
-        absent_parents = frozenset(
-            parent
-            for parent in all_desired_parents
-            if not filesystem.directory_exists(parent)
-        )
+        absent_parents: set[str] = set()
+        replaced_symlink_targets: dict[str, str] = {
+            item["path"]: item["target"] for item in previous_replaced
+        }
+        probe = getattr(filesystem, "probe_entry", None)
+        read_link = getattr(filesystem, "read_symlink", None)
+        for parent in all_desired_parents:
+            if probe is None:
+                if not filesystem.directory_exists(parent):
+                    absent_parents.add(parent)
+                continue
+            kind = probe(parent)
+            if kind is None:
+                absent_parents.add(parent)
+            elif kind is PathEntryKind.SYMLINK:
+                if read_link is None:
+                    raise InvalidEffectError(
+                        "filesystem cannot read symlink parents for replacement"
+                    )
+                absent_parents.add(parent)
+                replaced_symlink_targets[parent] = read_link(parent)
+            elif kind is not PathEntryKind.DIRECTORY:
+                raise UnsafePathError(
+                    f'parent path is not a safe directory: "{parent}"',
+                    path=filesystem.base / parent,
+                )
         next_created_parents = _sorted_parents(
             tuple(
                 parent
@@ -640,13 +821,23 @@ class ReconcileFileSetEffect:
                 if any(_is_parent(parent, path) for path in desired_by_path)
             )
         )
+        # Drop symlink replacements that are no longer needed.
+        replaced_symlink_targets = {
+            parent: target
+            for parent, target in replaced_symlink_targets.items()
+            if parent in next_created_parents
+        }
         released_parents = frozenset(previous_created_parents) - frozenset(
             next_created_parents
         )
         restore_parents = frozenset(
             parent
             for parent in released_parents
-            if filesystem.directory_exists(parent)
+            if (
+                probe(parent) is PathEntryKind.DIRECTORY
+                if probe is not None
+                else filesystem.directory_exists(parent)
+            )
         )
 
         decisions: list[JsonValue] = []
@@ -654,7 +845,9 @@ class ReconcileFileSetEffect:
         for path in all_paths:
             desired_entry = desired_by_path.get(path)
             previous_entry = previous_by_path.get(path)
-            disk_bytes = _read_optional(filesystem, path)
+            disk_bytes = _read_optional_under_replaced_parents(
+                filesystem, path, set(replaced_symlink_targets)
+            )
             disk_hash = sha256_bytes(disk_bytes) if disk_bytes is not None else None
             desired_hash = (
                 cast(str, desired_entry["desired_hash"])
@@ -738,6 +931,11 @@ class ReconcileFileSetEffect:
             "files": next_files,
             "created_parents": list(next_created_parents),
         }
+        if replaced_symlink_targets:
+            state["replaced_symlinks"] = [
+                {"path": parent, "target": replaced_symlink_targets[parent]}
+                for parent in _sorted_parents(tuple(replaced_symlink_targets))
+            ]
         payload: JsonObject = {"version": _STATE_VERSION, "decisions": decisions}
         resource_path = filesystem.base
         if destination != ".":
@@ -758,6 +956,7 @@ class ReconcileFileSetEffect:
         files, _created_parents = _validate_tracking_state(
             prepared.before_state, decisions
         )
+        _apply_symlink_replacements(filesystem, prepared.before_state, checkpoint)
         for index, decision in enumerate(decisions):
             action = str(decision["decision"])
             released = decision["released_parents"]
@@ -852,13 +1051,14 @@ class ReconcileFileSetEffect:
                     raise InvalidEffectError("apply checkpoint must be an object")
                 apply_states.append((name, cast(Mapping[str, JsonValue], state)))
         if context.operation is not Operation.UNINSTALL:
-            self._rollback(filesystem, checkpoint, apply_states)
+            self._rollback(filesystem, before_state, checkpoint, apply_states)
             return
         self._uninstall(filesystem, before_state, checkpoint)
 
     def _rollback(
         self,
         filesystem: _EffectFilesystem,
+        before_state: JsonValue,
         checkpoint: CheckpointWriter,
         apply_states: Sequence[tuple[str, Mapping[str, JsonValue]]],
     ) -> None:
@@ -966,6 +1166,7 @@ class ReconcileFileSetEffect:
                     "outcome": outcome,
                 },
             )
+        _restore_symlink_replacements(filesystem, before_state, checkpoint)
 
     def _uninstall(
         self,
@@ -973,7 +1174,7 @@ class ReconcileFileSetEffect:
         before_state: JsonValue,
         checkpoint: CheckpointWriter,
     ) -> None:
-        files, created_parents = _parse_state(before_state)
+        files, created_parents, replaced_symlinks = _parse_state(before_state)
         for index, entry in enumerate(files):
             path = entry["path"]
             expected_hash = entry["installed_hash"]
@@ -1049,6 +1250,7 @@ class ReconcileFileSetEffect:
                     "outcome": "removed" if removed else "preserved_nonempty",
                 },
             )
+        _restore_symlink_replacements(filesystem, before_state, checkpoint)
 
 
 __all__ = [

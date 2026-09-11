@@ -648,3 +648,25 @@ def test_posix_backend_is_unavailable_without_listdir_fd_support(
         path_safety.safe_filesystem_backend_status(platform_name="linux")
         is path_safety.SafeFilesystemBackendStatus.UNAVAILABLE
     )
+
+
+def test_replace_symlink_with_directory_and_restore_target(tmp_path: Path) -> None:
+    base = tmp_path / "skills"
+    target = tmp_path / "repo-clone"
+    base.mkdir()
+    target.mkdir()
+    (base / "lacuna-signer").symlink_to(target)
+
+    with SafeFilesystem(base) as filesystem:
+        previous = filesystem.replace_symlink_with_directory("lacuna-signer")
+        assert previous == str(target)
+        assert (base / "lacuna-signer").is_dir()
+        assert not (base / "lacuna-signer").is_symlink()
+        filesystem.atomic_write_bytes("lacuna-signer/SKILL.md", b"skill\n")
+        assert (base / "lacuna-signer" / "SKILL.md").read_bytes() == b"skill\n"
+        filesystem.unlink("lacuna-signer/SKILL.md")
+        filesystem.rmdir_empty("lacuna-signer")
+        filesystem.symlink("lacuna-signer", previous)
+
+    assert (base / "lacuna-signer").is_symlink()
+    assert (base / "lacuna-signer").readlink() == target

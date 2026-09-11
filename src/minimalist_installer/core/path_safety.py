@@ -266,6 +266,14 @@ class _Backend(Protocol):
 
     def ensure_directory(self, parts: tuple[str, ...]) -> None: ...
 
+    def probe_entry(self, parts: tuple[str, ...]) -> PathEntryKind | None: ...
+
+    def read_symlink(self, parts: tuple[str, ...]) -> str: ...
+
+    def replace_symlink_with_directory(self, parts: tuple[str, ...]) -> str | None: ...
+
+    def symlink(self, parts: tuple[str, ...], target: str) -> None: ...
+
     def atomic_write_bytes(
         self,
         parts: tuple[str, ...],
@@ -559,6 +567,78 @@ class _PosixBackend:
                     except FileNotFoundError:
                         pass
 
+    def probe_entry(self, parts: tuple[str, ...]) -> PathEntryKind | None:
+        """Return the no-follow entry kind, including symlink/reparse, or None."""
+
+        display = self.base.joinpath(*parts)
+        try:
+            with self._open_parent(parts, create=False) as (parent_fd, leaf):
+                try:
+                    entry = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    return None
+                return classify_entry(entry, platform_name=self.platform_name)
+        except FileNotFoundError:
+            return None
+
+    def read_symlink(self, parts: tuple[str, ...]) -> str:
+        display = self.base.joinpath(*parts)
+        with self._open_parent(parts, create=False) as (parent_fd, leaf):
+            try:
+                entry = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise FileNotFoundError(display) from error
+            kind = classify_entry(entry, platform_name=self.platform_name)
+            if kind is not PathEntryKind.SYMLINK:
+                raise _unsafe("read_symlink requires a symlink leaf", display)
+            return os.readlink(leaf, dir_fd=parent_fd)
+
+    def replace_symlink_with_directory(self, parts: tuple[str, ...]) -> str | None:
+        """Replace a symlink leaf with a real directory; return prior target."""
+
+        display = self.base.joinpath(*parts)
+        with self._open_parent(parts, create=True) as (parent_fd, leaf):
+            try:
+                entry = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                os.mkdir(leaf, mode=0o700, dir_fd=parent_fd)
+                if directory_fsync_supported(platform_name=self.platform_name):
+                    _fsync_directory_descriptor(parent_fd)
+                return None
+            kind = classify_entry(entry, platform_name=self.platform_name)
+            if kind is PathEntryKind.DIRECTORY:
+                return None
+            if kind is not PathEntryKind.SYMLINK:
+                raise _unsafe(
+                    "replace_symlink_with_directory requires a symlink or absent path",
+                    display,
+                )
+            target = os.readlink(leaf, dir_fd=parent_fd)
+            os.unlink(leaf, dir_fd=parent_fd)
+            os.mkdir(leaf, mode=0o700, dir_fd=parent_fd)
+            if directory_fsync_supported(platform_name=self.platform_name):
+                _fsync_directory_descriptor(parent_fd)
+            return target
+
+    def symlink(self, parts: tuple[str, ...], target: str) -> None:
+        """Create a no-follow symlink leaf below the trusted base."""
+
+        if not isinstance(target, str) or not target:
+            raise TypeError("symlink target must be non-empty text")
+        display = self.base.joinpath(*parts)
+        with self._open_parent(parts, create=True) as (parent_fd, leaf):
+            kind = None
+            try:
+                entry = os.stat(leaf, dir_fd=parent_fd, follow_symlinks=False)
+                kind = classify_entry(entry, platform_name=self.platform_name)
+            except FileNotFoundError:
+                pass
+            if kind is not None:
+                raise _unsafe("symlink leaf already exists", display)
+            os.symlink(target, leaf, dir_fd=parent_fd)
+            if directory_fsync_supported(platform_name=self.platform_name):
+                _fsync_directory_descriptor(parent_fd)
+
     def unlink(self, parts: tuple[str, ...], *, missing_ok: bool) -> bool:
         display = self.base.joinpath(*parts)
         try:
@@ -725,6 +805,33 @@ class SafeFilesystem:
         """Create one directory path safely and idempotently below the base."""
 
         self._backend.ensure_directory(self._parts(relative))
+
+    def probe_entry(self, relative: os.PathLike[str] | str) -> PathEntryKind | None:
+        """Return the no-follow entry kind (including symlink) or None if absent."""
+
+        return self._backend.probe_entry(self._parts(relative))
+
+    def read_symlink(self, relative: os.PathLike[str] | str) -> str:
+        """Return the raw target text of a symlink leaf below the trusted base."""
+
+        return self._backend.read_symlink(self._parts(relative))
+
+    def replace_symlink_with_directory(
+        self, relative: os.PathLike[str] | str
+    ) -> str | None:
+        """If ``relative`` is a symlink, replace it with a real directory.
+
+        Returns the previous symlink target text, or ``None`` when the path was
+        already a directory or was created fresh. Refuses regular files and
+        other non-symlink leaves.
+        """
+
+        return self._backend.replace_symlink_with_directory(self._parts(relative))
+
+    def symlink(self, relative: os.PathLike[str] | str, target: str) -> None:
+        """Create a symlink leaf that does not follow existing link-like names."""
+
+        self._backend.symlink(self._parts(relative), target)
 
     def read_json(self, relative: os.PathLike[str] | str) -> Any:
         """Read UTF-8 JSON through the safe byte reader."""
