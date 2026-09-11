@@ -56,3 +56,7 @@ installer.install(base_path=Path.home() / "tmp-install-root")
 
 - Node engine: https://github.com/henryavila/minimalist-installer
 - Design/plan: `docs/plans/2026-09-10-python-port*.md`
+
+## Platform support
+
+Linux and macOS are exercised in CI. Windows currently **fails closed** for filesystem mutations (no safe no-follow backend yet); detection/planning APIs still import.
