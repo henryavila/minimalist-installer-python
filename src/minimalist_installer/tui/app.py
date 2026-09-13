@@ -532,11 +532,25 @@ class InstallerApp:
 
 
 def create_questionary_prompts() -> PromptPort:
-    """Lazy-import Questionary and return a real prompt adapter."""
+    """Lazy-import Questionary and return a clack-styled prompt adapter."""
 
     require_tui_dependencies()
     import questionary
     from questionary import Choice as QChoice
+
+    from .prompt_style import (
+        CHECKBOX_INSTRUCTION,
+        SELECT_INSTRUCTION,
+        build_prompt_style,
+        prompt_pointer,
+        prompt_qmark,
+    )
+    from .theme import resolve_theme
+
+    theme = resolve_theme(unicode_ok=detect_unicode_ok())
+    style = build_prompt_style(color=theme.color)
+    pointer = prompt_pointer(unicode_ok=theme.unicode)
+    qmark = prompt_qmark(unicode_ok=theme.unicode)
 
     class QuestionaryPrompts:
         def select(
@@ -550,8 +564,20 @@ def create_questionary_prompts() -> PromptPort:
                 QChoice(title=item.label, value=item.value)
                 for item in choices
             ]
+            default_choice = next(
+                (item for item in q_choices if item.value == default),
+                default,
+            )
             result = questionary.select(
-                message, choices=q_choices, default=default
+                message,
+                choices=q_choices,
+                default=default_choice,
+                style=style,
+                pointer=pointer,
+                qmark=qmark,
+                instruction=SELECT_INSTRUCTION,
+                use_indicator=False,
+                show_selected=False,
             ).ask()
             return result
 
@@ -566,11 +592,23 @@ def create_questionary_prompts() -> PromptPort:
                 )
                 for item in choices
             ]
-            result = questionary.checkbox(message, choices=q_choices).ask()
+            result = questionary.checkbox(
+                message,
+                choices=q_choices,
+                style=style,
+                pointer=pointer,
+                qmark=qmark,
+                instruction=CHECKBOX_INSTRUCTION,
+            ).ask()
             return result
 
         def confirm(self, message: str, *, default: bool = False) -> bool | None:
-            return questionary.confirm(message, default=default).ask()
+            return questionary.confirm(
+                message,
+                default=default,
+                style=style,
+                qmark=qmark,
+            ).ask()
 
     return QuestionaryPrompts()
 
