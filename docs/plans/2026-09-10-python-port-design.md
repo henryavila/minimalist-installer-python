@@ -57,7 +57,7 @@ consumer, not a concern embedded in the kernel.
 | D12 | Host knowledge lives in the installer distribution as declarative adapters, extended through Python entry points. Consumers never hardcode host paths. |
 | D13 | Detection returns confidence plus evidence. It preselects TUI choices but never authorizes writes. |
 | D14 | Deduplicate identical physical destinations, including shared `~/.agents/skills` discovery. |
-| D15 | TUI dependencies are optional through `minimalist-installer[tui]`; use Rich plus Questionary. |
+| D15 | TUI dependencies are optional through `minimalist-installer[tui]`; use Rich plus Questionary with clack-like select/checkbox contrast (`tui/prompt_style.py`). |
 | D16 | Non-interactive commands never prompt, support JSON output, and fail if no host is detected or selected. |
 | D17 | User and project scope are first-class. Project scope resolves safely and refuses filesystem root, home-as-project, bare repositories, and unwritable targets. |
 | D18 | The package reports `verified`, `layout-only`, or `external` host support. Installation support and real-agent workflow qualification remain distinct. |
@@ -328,7 +328,8 @@ Grok skills do not require plugin hooks.
 ## TUI and CLI
 
 The optional TUI uses Rich for output/progress and Questionary for select,
-multiselect, and confirmation. It mirrors the Atomic flow:
+multiselect, and confirmation. It mirrors the Atomic Skills flow
+(`@clack/prompts` in Atomic’s `src/ui.js`):
 
 ```text
 intro/version
@@ -341,6 +342,23 @@ intro/version
   -> execution/progress
   -> per-host summary and next steps
 ```
+
+### Presentation chrome (D15)
+
+Questionary’s default style leaves `pointer`, `highlighted`, and `selected`
+empty, so the focused row is easy to miss. `tui/prompt_style.py` supplies a
+clack-inspired style consumed by `create_questionary_prompts()`:
+
+| Token | Intent |
+|---|---|
+| `highlighted` / `pointer` | Active row — cyan + `❯` (ASCII `>` when Unicode is unsafe) |
+| `selected` | Checked checkbox items — green |
+| `qmark` | `◆` (ASCII `*`) |
+| `instruction` | Short hints: arrow/enter for select; space to toggle for checkbox |
+
+Rich remains responsible for non-prompt chrome (rules, evidence lines, spinner,
+summaries). Controllers stay injectable via `PromptPort` / `ConsolePort`; only
+the live adapters pull Rich/Questionary.
 
 The presentation layer consumes structured results; it never owns mutation
 logic. It supports Portuguese and English, `NO_COLOR`, keyboard cancellation,

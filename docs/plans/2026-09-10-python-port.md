@@ -385,8 +385,10 @@ git commit -m "feat(python): plan portable skill distributions"
 - Create: `python/src/minimalist_installer/tui/app.py`
 - Create: `python/src/minimalist_installer/tui/messages.py`
 - Create: `python/src/minimalist_installer/tui/theme.py`
+- Create: `python/src/minimalist_installer/tui/prompt_style.py` *(follow-up: clack-like Questionary contrast, 2026-09-13)*
 - Create: `python/src/minimalist_installer/cli.py`
 - Create: `python/tests/tui/test_app.py`
+- Create: `python/tests/tui/test_prompt_style.py` *(follow-up with `prompt_style.py`)*
 - Create: `python/tests/test_cli.py`
 
 **Step 1: Write failing scripted-TUI and CLI tests**

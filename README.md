@@ -45,6 +45,49 @@ installer.install(base_path=Path.home() / "tmp-install-root")
 - `spec/` — shared conformance vectors and JSON schemas
 - `tests/` — pytest suite
 
+## Interactive TUI (`[tui]`)
+
+Install with the optional extra:
+
+```bash
+python3 -m pip install \
+  "minimalist-installer[tui] @ git+https://github.com/henryavila/minimalist-installer-python.git@main"
+```
+
+Interactive install (TTY required; cancels before confirm leave no transaction):
+
+```bash
+minimalist-installer install path/to/distribution.toml
+```
+
+The flow mirrors Atomic Skills (`@clack/prompts`):
+
+```text
+intro/version
+  → scope (user | project)
+  → detected hosts + evidence
+  → host multiselect (preselect by confidence)
+  → language (en | pt)
+  → planned files / conflicts
+  → confirm → progress → per-host summary
+```
+
+Presentation:
+
+| Layer | Role |
+|---|---|
+| Rich | Intro, evidence, plan listing, spinner, summary |
+| Questionary | Select, checkbox, confirm |
+
+Questionary’s stock styles leave the active row nearly invisible. This package
+applies a clack-like chrome in `tui/prompt_style.py`: cyan focused row + `❯`
+pointer, green checked items, `◆` question mark, and short navigation hints.
+`NO_COLOR` and non-Unicode terminals fall back to bold/ASCII glyphs (`>` / `*`).
+
+Consumers (for example lacuna-signer `skill setup --menu`) call the same
+`run_install_flow` + `create_questionary_prompts` path — they do not ship a
+separate menu UI.
+
 ## Development
 
 ```bash
@@ -55,6 +98,7 @@ installer.install(base_path=Path.home() / "tmp-install-root")
 ## Related
 
 - Node engine: https://github.com/henryavila/minimalist-installer
+- Atomic Skills TUI reference: `@clack/prompts` in `atomic-skills` `src/ui.js`
 - Design/plan: `docs/plans/2026-09-10-python-port*.md`
 
 ## Platform support
